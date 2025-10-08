@@ -110,6 +110,7 @@ pub struct NBDConnect {
     block_size_bytes: u64,
     server_flags: u64,
     client_flags: u64,
+    device_index: Option<u32>,
 }
 
 impl NBDConnect {
@@ -120,6 +121,7 @@ impl NBDConnect {
             block_size_bytes: 4096,
             server_flags: HAS_FLAGS,
             client_flags: 0,
+            device_index: None,
         }
     }
 
@@ -165,6 +167,13 @@ impl NBDConnect {
         self
     }
 
+    /// Set the specific NBD device index to connect to (e.g., 0 for /dev/nbd0).
+    /// If not set, the kernel will choose the first available device.
+    pub fn device_index(&mut self, index: u32) -> &mut Self {
+        self.device_index = Some(index);
+        self
+    }
+
     /// Tell the kernel to connect an NBD device to the specified sockets.
     ///
     /// Returns the index of the newly connected NBD device.
@@ -189,6 +198,10 @@ impl NBDConnect {
             )?)?;
         }
         let mut attrs = GenlBuffer::new();
+        // If device_index is specified, add it to the request
+        if let Some(index) = self.device_index {
+            attrs.push(attr(NbdAttr::Index, index)?);
+        }
         attrs.push(attr(NbdAttr::SizeBytes, self.size_bytes)?);
         attrs.push(attr(NbdAttr::BlockSizeBytes, self.block_size_bytes)?);
         attrs.push(attr(NbdAttr::ServerFlags, self.server_flags)?);
