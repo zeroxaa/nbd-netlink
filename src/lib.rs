@@ -87,6 +87,17 @@ const NBD_CFLAG_DISCONNECT_ON_CLOSE: u64 = 1 << 1;
 pub struct NBD {
     nl: NlSocketHandle,
     nbd_family: u16,
+    device_index: Option<u32>, // Track which device this handle is for
+}
+
+impl Drop for NBD {
+    fn drop(&mut self) {
+        if let Some(idx) = self.device_index {
+            // eprintln!("[NBD::drop] ⚠️  NBD handle for /dev/nbd{} being dropped! Netlink socket closing.", idx);
+        } else {
+            // eprintln!("[NBD::drop] ⚠️  NBD handle (device not yet assigned) being dropped! Netlink socket closing.");
+        }
+    }
 }
 
 impl NBD {
@@ -96,11 +107,44 @@ impl NBD {
     /// the kernel does not have `nbd` support, or if it has `nbd` built as a module and not
     /// loaded, this will result in an error.
     pub fn new() -> anyhow::Result<Self> {
+        // eprintln!("[NBD::new] 🆕 Creating new NBD netlink socket");
         let mut nl = NlSocketHandle::new(NlFamily::Generic)?;
         let nbd_family = nl
             .resolve_genl_family("nbd")
             .context("Could not resolve the NBD generic netlink family")?;
-        Ok(Self { nl, nbd_family })
+        // eprintln!("[NBD::new] ✅ NBD netlink socket created, family={}", nbd_family);
+        Ok(Self { nl, nbd_family, device_index: None })
+    }
+
+    /// Disconnect the NBD device from the kernel.
+    ///
+    /// Sends a DISCONNECT command via netlink to tell the kernel to disconnect the specified
+    /// NBD device. This should be called after the VM/process using the device has closed it.
+    pub fn disconnect(&mut self, device_index: u32) -> anyhow::Result<()> {
+        fn attr<T: NlAttrType>(
+            t: T,
+            p: impl Size + ToBytes,
+        ) -> Result<Nlattr<T, Buffer>, SerError> {
+            Nlattr::new(false, false, t, p)
+        }
+
+        let mut attrs = GenlBuffer::new();
+        attrs.push(attr(NbdAttr::Index, device_index)?);
+
+        let genl_header = Genlmsghdr::new(NbdCmd::Disconnect, 1, attrs);
+        let nl_header = Nlmsghdr::new(
+            None,
+            self.nbd_family,
+            NlmFFlags::new(&[NlmF::Request]),
+            None,
+            None,
+            NlPayload::Payload(genl_header),
+        );
+
+        self.nl.send(nl_header)?;
+
+        // Note: We don't wait for a response as DISCONNECT is fire-and-forget
+        Ok(())
     }
 }
 
@@ -217,13 +261,17 @@ impl NBDConnect {
             None,
             NlPayload::Payload(genl_header),
         );
+        // eprintln!("[NBDConnect::connect] 📤 Sending CONNECT command to kernel via netlink...");
         nbd.nl.send(nl_header)?;
+        // eprintln!("[NBDConnect::connect] 📥 Waiting for kernel response...");
         let response: Nlmsghdr<u16, Genlmsghdr<NbdCmd, NbdAttr>> = nbd
             .nl
             .recv()?
             .ok_or_else(|| anyhow!("Error connecting NBD device: No response received"))?;
         let handle = response.get_payload()?.get_attr_handle();
         let index = handle.get_attr_payload_as::<u32>(NbdAttr::Index)?;
+        nbd.device_index = Some(index); // Store device index for tracking
+        // eprintln!("[NBDConnect::connect] ✅ Kernel allocated device index: {} (stored in NBD handle)", index);
         Ok(index)
     }
 }
